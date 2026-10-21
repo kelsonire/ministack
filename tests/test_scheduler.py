@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import time
+from datetime import datetime
 
 import boto3
 import pytest
@@ -777,6 +778,138 @@ def test_scheduler_ticker_dispatches_in_schedule_region_and_restores_context(mon
         assert event["Resources"] == [schedule_arn]
         assert schedule["Arn"] == schedule_arn
     assert (get_account_id(), get_region()) == ("111111111111", "eu-west-1")
+
+
+def _create_zoned_schedule(expression, timezone_name):
+    resp = _request("POST", f"/schedules/zoned-{_uid()}", {
+        "ScheduleExpression": expression,
+        "ScheduleExpressionTimezone": timezone_name,
+        "FlexibleTimeWindow": {"Mode": "OFF"},
+        "Target": {
+            "Arn": "arn:aws:lambda:us-east-1:000000000000:function:noop",
+            "RoleArn": "arn:aws:iam::000000000000:role/test",
+        },
+    })
+    assert resp[0] == 200
+
+
+def _sweeps_that_fire(monkeypatch, *instants):
+    """Run one sweep at each UTC instant, in order; return the instants that fired."""
+    from ministack.services import eventbridge
+
+    fired = []
+    sweep = {}
+    monkeypatch.setattr(scheduler_mod.time, "time", lambda: sweep["epoch"])
+    monkeypatch.setattr(
+        eventbridge, "_invoke_target", lambda *args, **kwargs: fired.append(sweep["instant"])
+    )
+    for instant in instants:
+        sweep["instant"] = instant
+        sweep["epoch"] = datetime.fromisoformat(instant).timestamp()
+        scheduler_mod._tick_schedules()
+    return fired
+
+
+def test_scheduler_at_expression_fires_in_its_timezone(monkeypatch):
+    # 09:00 in Asia/Tokyo (UTC+9) is 00:00 UTC.
+    _create_zoned_schedule("at(2030-01-01T09:00:00)", "Asia/Tokyo")
+
+    fired = _sweeps_that_fire(
+        monkeypatch,
+        "2029-12-31T23:59:50+00:00",
+        "2030-01-01T00:00:00+00:00",
+    )
+
+    assert fired == ["2030-01-01T00:00:00+00:00"]
+
+
+def test_scheduler_cron_expression_fires_in_its_timezone(monkeypatch):
+    # The AWS Scheduler user guide's example: every day at 08:30 in America/New_York,
+    # which is UTC-4 in July.
+    _create_zoned_schedule("cron(30 8 * * ? *)", "America/New_York")
+
+    fired = _sweeps_that_fire(
+        monkeypatch,
+        "2026-07-01T00:00:00+00:00",  # the first sweep anchors the schedule
+        "2026-07-01T08:30:00+00:00",  # 04:30 in New York
+        "2026-07-01T12:30:00+00:00",  # 08:30 in New York
+    )
+
+    assert fired == ["2026-07-01T12:30:00+00:00"]
+
+
+def test_scheduler_cron_skips_a_time_the_spring_forward_gap_removes(monkeypatch):
+    # The user guide's example: cron(30 2 * * ? *) in America/Los_Angeles. On
+    # 2026-03-08 clocks jump from 02:00 to 03:00, so that day's 02:30 is skipped.
+    _create_zoned_schedule("cron(30 2 * * ? *)", "America/Los_Angeles")
+
+    fired = _sweeps_that_fire(
+        monkeypatch,
+        "2026-03-07T12:00:00+00:00",  # the first sweep anchors the schedule
+        "2026-03-08T11:00:00+00:00",  # 03:00 PDT on 2026-03-08, after the gap
+        "2026-03-09T09:30:00+00:00",  # 02:30 PDT on 2026-03-09
+    )
+
+    assert fired == ["2026-03-09T09:30:00+00:00"]
+
+
+def test_scheduler_cron_that_only_matches_the_spring_forward_gap_never_fires(monkeypatch):
+    # 02:30 on the second Sunday of March never exists in Los Angeles: US clocks
+    # jump from 02:00 to 03:00 that morning every year (2026-03-08, 2027-03-14).
+    _create_zoned_schedule("cron(30 2 ? 3 1#2 *)", "America/Los_Angeles")
+
+    fired = _sweeps_that_fire(
+        monkeypatch,
+        "2026-03-01T12:00:00+00:00",  # the first sweep anchors the schedule
+        "2026-03-08T11:00:00+00:00",  # 03:00 PDT on 2026-03-08, after the gap
+        "2027-03-14T11:00:00+00:00",  # 03:00 PDT on 2027-03-14, after the gap
+    )
+
+    assert fired == []
+
+
+def test_scheduler_cron_fires_once_at_a_time_the_fall_back_repeats(monkeypatch):
+    # On 2026-11-01 Los Angeles clocks go back from 02:00 PDT to 01:00 PST, so
+    # 01:30 happens twice; AWS fires at the first one only.
+    _create_zoned_schedule("cron(30 1 * * ? *)", "America/Los_Angeles")
+
+    fired = _sweeps_that_fire(
+        monkeypatch,
+        "2026-11-01T07:00:00+00:00",  # the first sweep anchors the schedule
+        "2026-11-01T08:30:00+00:00",  # 01:30 PDT
+        "2026-11-01T09:30:00+00:00",  # 01:30 PST, the repeat
+        "2026-11-02T09:30:00+00:00",  # 01:30 PST on 2026-11-02
+    )
+
+    assert fired == ["2026-11-01T08:30:00+00:00", "2026-11-02T09:30:00+00:00"]
+
+
+def test_scheduler_cron_anchored_in_the_repeated_hour_waits_for_the_next_day(monkeypatch):
+    # Anchored at 01:10 PST, after the first 01:30 (PDT) has passed: the repeated
+    # 01:30 (PST) must not fire, nor may the earlier PDT one fire late.
+    _create_zoned_schedule("cron(30 1 * * ? *)", "America/Los_Angeles")
+
+    fired = _sweeps_that_fire(
+        monkeypatch,
+        "2026-11-01T09:10:00+00:00",  # the first sweep anchors the schedule (01:10 PST)
+        "2026-11-01T09:10:10+00:00",
+        "2026-11-01T09:30:00+00:00",  # 01:30 PST, the repeat
+        "2026-11-02T09:30:00+00:00",  # 01:30 PST on 2026-11-02
+    )
+
+    assert fired == ["2026-11-02T09:30:00+00:00"]
+
+
+def test_scheduler_unknown_timezone_is_evaluated_in_utc(monkeypatch):
+    _create_zoned_schedule("at(2030-01-01T09:00:00)", "Mars/Olympus_Mons")
+
+    fired = _sweeps_that_fire(
+        monkeypatch,
+        "2030-01-01T08:59:50+00:00",
+        "2030-01-01T09:00:00+00:00",
+    )
+
+    assert fired == ["2030-01-01T09:00:00+00:00"]
 
 
 def test_scheduler_start_scheduler_starts_daemon_once(monkeypatch):

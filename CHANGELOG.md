@@ -9,6 +9,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **Aurora DSQL — the backend Postgres is no longer published on every interface** — with `DSQL_STRICT=1` each cluster's backing Postgres container (trust auth, `postgres` superuser, no password) was published on `0.0.0.0` and `::`, so anyone on the same network could read and change the database directly, bypassing the proxy, even when MiniStack's own ports are bound to `127.0.0.1`. A containerised MiniStack reaches the backend over its Docker network, so the port is no longer published; a MiniStack running on the host publishes it on `127.0.0.1` only. Contributed by @toby6578.
+- **EventBridge Scheduler — `ScheduleExpressionTimezone`** — schedules fired as if every `at()` and `cron()` time were UTC, whatever zone `ScheduleExpressionTimezone` named, so `at(2030-01-01T09:00:00)` in `Asia/Tokyo` fired nine hours late; both are now evaluated in the named IANA zone, as the Scheduler user guide documents. A `cron()` time that the spring-forward gap removes is skipped, and one that the fall-back repeats fires once. `rate()` is unaffected, and a zone name the zone database does not know is still evaluated in UTC. Contributed by @kelsonire.
 
 ## [1.5.37] — 2026-11-03
 

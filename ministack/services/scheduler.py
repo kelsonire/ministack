@@ -13,14 +13,16 @@ Supports:
 """
 
 import copy
+import functools
 import json
 import logging
 import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from urllib.parse import unquote
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ministack.core.arn import ArnParseError, parse_arn
 from ministack.core.responses import (
@@ -549,7 +551,8 @@ async def handle_request(method, path, headers, body_bytes, query_params):
 # and its single-``Target`` shape. Rate/cron parsing and target dispatch are
 # reused from EventBridge so behavior matches the rules path exactly; the extras
 # unique to Scheduler are handled here: ``at()`` one-time expressions,
-# ``ActionAfterCompletion`` one-shot delete, ``State`` and ``StartDate``/``EndDate``.
+# ``ActionAfterCompletion`` one-shot delete, ``State`` and ``StartDate``/``EndDate``,
+# and ``ScheduleExpressionTimezone`` for ``at()`` and ``cron()``.
 
 _SCHEDULE_TICK_INTERVAL = 10  # seconds between sweeps
 _schedule_last_fired: dict = {}  # (account_id, region, "group/name") -> epoch; not persisted
@@ -569,9 +572,28 @@ def _to_epoch(value):
         return None
 
 
-def _at_time_epoch(expr: str):
-    """Parse an ``at(yyyy-mm-ddThh:mm:ss)`` one-time expression to a UTC epoch,
-    or None when the expression is not an ``at()`` form."""
+# Cached so a name the zone database does not know warns once, not on every sweep.
+@functools.lru_cache(maxsize=256)
+def _zone(name: str) -> tzinfo:
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        logger.warning("Unknown ScheduleExpressionTimezone %r; evaluating in UTC", name)
+        return timezone.utc
+
+
+def _schedule_timezone(sched) -> tzinfo:
+    """The IANA zone ``at()`` and ``cron()`` are evaluated in (UTC by default).
+    A name the zone database does not know is evaluated in UTC."""
+    name = sched.get("ScheduleExpressionTimezone")
+    if not isinstance(name, str) or name in ("", "UTC"):
+        return timezone.utc
+    return _zone(name)
+
+
+def _at_time_epoch(expr: str, tz: tzinfo = timezone.utc) -> float | None:
+    """Parse an ``at(yyyy-mm-ddThh:mm:ss)`` one-time expression, read as a wall
+    time in ``tz``, to an epoch, or None when the expression is not an ``at()`` form."""
     m = re.match(r"^\s*at\((.+)\)\s*$", expr)
     if not m:
         return None
@@ -580,7 +602,7 @@ def _at_time_epoch(expr: str):
     except ValueError:
         return None
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.replace(tzinfo=tz)
     return dt.timestamp()
 
 
@@ -592,9 +614,42 @@ def _is_event_bus_arn(arn):
     return spec.service == "events" and spec.resource.startswith("event-bus/")
 
 
+def _wall_time_exists(dt: datetime) -> bool:
+    """False for a wall time inside a daylight saving spring-forward gap."""
+    roundtrip = dt.astimezone(timezone.utc).astimezone(dt.tzinfo)
+    return roundtrip.replace(tzinfo=None) == dt.replace(tzinfo=None)
+
+
+# How far ahead ``_cron_next_fire`` looks, matching the four years after which
+# ``eventbridge._cron_next_fire`` gives up.
+_CRON_SEARCH_HORIZON = timedelta(days=4 * 366)
+
+
+def _cron_next_fire(fields, after_dt: datetime) -> datetime | None:
+    """The next ``cron()`` occurrence after ``after_dt``, in ``after_dt``'s zone,
+    or None when there is none within ``_CRON_SEARCH_HORIZON``.
+
+    ``eventbridge._cron_next_fire`` walks wall-clock fields, so it can return a
+    wall time the spring-forward gap removes, which AWS skips, or the first
+    occurrence of a wall time the fall-back repeats when ``after_dt`` is already
+    past it, which would fire the repeated time twice. Both are walked past.
+    The horizon stops the walk for a schedule that only ever matches gap times,
+    such as ``cron(30 2 ? 3 1#2 *)`` in ``America/Los_Angeles``."""
+    from ministack.services import eventbridge as _eb
+
+    horizon = after_dt + _CRON_SEARCH_HORIZON
+    fire = _eb._cron_next_fire(fields, after_dt)
+    while fire is not None and fire <= horizon:
+        if _wall_time_exists(fire) and fire.timestamp() > after_dt.timestamp():
+            return fire
+        fire = _eb._cron_next_fire(fields, fire)
+    return None
+
+
 def _tick_schedules():
     """Fire every ENABLED schedule that is due, honoring State, Start/EndDate,
-    at()/rate()/cron() expressions and ActionAfterCompletion one-shot delete."""
+    at()/rate()/cron() expressions (at() and cron() in ScheduleExpressionTimezone)
+    and ActionAfterCompletion one-shot delete."""
     from ministack.services import eventbridge as _eb
 
     now = time.time()
@@ -618,9 +673,10 @@ def _tick_schedules():
                 continue
 
             expr = sched.get("ScheduleExpression", "")
+            tz = _schedule_timezone(sched)
             one_shot = False
 
-            at_epoch = _at_time_epoch(expr)
+            at_epoch = _at_time_epoch(expr, tz)
             if at_epoch is not None:
                 # One-time at(): fire once when the moment has passed.
                 if now < at_epoch or state_key in _schedule_last_fired:
@@ -642,8 +698,8 @@ def _tick_schedules():
                     if state_key not in _schedule_last_fired:
                         _schedule_last_fired[state_key] = now
                         continue
-                    last_dt = datetime.fromtimestamp(_schedule_last_fired[state_key], tz=timezone.utc)
-                    next_fire = _eb._cron_next_fire(fields, last_dt)
+                    last_dt = datetime.fromtimestamp(_schedule_last_fired[state_key], tz=tz)
+                    next_fire = _cron_next_fire(fields, last_dt)
                     if next_fire is None or now_dt < next_fire:
                         continue
 
